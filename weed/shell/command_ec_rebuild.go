@@ -81,10 +81,11 @@ func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.W
 
 	var collections []string
 	if *collection == "EACH_COLLECTION" {
-		collections, err = ListCollectionNames(commandEnv, false, true)
+		cs, err := ListCollectionNames(commandEnv, false, true)
 		if err != nil {
 			return err
 		}
+		collections = cs
 	} else {
 		collections = []string{*collection}
 	}
@@ -101,7 +102,6 @@ func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.W
 }
 
 func rebuildEcVolumes(commandEnv *CommandEnv, allEcNodes []*EcNode, collection string, writer io.Writer, applyChanges bool) error {
-
 	fmt.Printf("rebuildEcVolumes %s\n", collection)
 
 	// collect vid => each shard locations, similar to ecShardMap in topology.go
