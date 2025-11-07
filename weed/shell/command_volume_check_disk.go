@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"sync"
 	"time"
 
 	"slices"
@@ -175,9 +174,7 @@ func (vcd *volumeCheckDisk) getVolumeStatusFileCount(vid uint32, dn *master_pb.D
 }
 
 func (vcd *volumeCheckDisk) eqVolumeFileCount(a, b *VolumeReplica) (bool, bool) {
-	var waitGroup sync.WaitGroup
 	var fileCountA, fileCountB, fileDeletedCountA, fileDeletedCountB uint64
-	waitGroup.Add(1)
 
 	ewg := NewErrorWaitGroup(DefaultMaxParallelization)
 	ewg.Add(func() error {
@@ -334,7 +331,7 @@ func (vcd *volumeCheckDisk) doVolumeCheckDisk(minuend, subtrahend *needle_map.Me
 			return hasChanges, err
 		}
 
-		if vcd.applyChanges {
+		if !vcd.applyChanges {
 			continue
 		}
 
