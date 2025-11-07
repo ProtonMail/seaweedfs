@@ -18,12 +18,13 @@ func init() {
 }
 
 type ecRebuilder struct {
-	// TODO: add ErrorWaitGroup for parallelization
 	commandEnv   *CommandEnv
 	ecNodes      []*EcNode
 	writer       io.Writer
 	applyChanges bool
 	collections  []string
+
+	ewg *ErrorWaitGroup
 }
 
 type commandEcRebuild struct {
@@ -71,6 +72,7 @@ func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.W
 
 	fixCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	collection := fixCommand.String("collection", "EACH_COLLECTION", "collection name, or \"EACH_COLLECTION\" for each collection")
+	maxParallelization := fixCommand.Int("maxParallelization", DefaultMaxParallelization, "run up to X tasks in parallel, whenever possible")
 	applyChanges := fixCommand.Bool("force", false, "apply the changes")
 	if err = fixCommand.Parse(args); err != nil {
 		return nil
@@ -103,17 +105,16 @@ func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.W
 		writer:       writer,
 		applyChanges: *applyChanges,
 		collections:  collections,
+
+		ewg: NewErrorWaitGroup(*maxParallelization),
 	}
 
 	fmt.Printf("rebuildEcVolumes for %d collection(s)\n", len(collections))
 	for _, c := range collections {
-		fmt.Printf("rebuildEcVolumes collection %s\n", c)
-		if err = erb.rebuildEcVolumes(c); err != nil {
-			return err
-		}
+		erb.rebuildEcVolumes(c)
 	}
 
-	return nil
+	return erb.ewg.Wait()
 }
 
 func (erb *ecRebuilder) write(format string, a ...any) {
@@ -141,12 +142,17 @@ func (erb *ecRebuilder) ecNodeWithMoreFreeSlots() *EcNode {
 }
 
 func (erb *ecRebuilder) rebuildEcVolumes(collection string) error {
-	fmt.Printf("rebuildEcVolumes %s\n", collection)
+	fmt.Printf("rebuildEcVolumes for %q\n", collection)
 
 	// collect vid => each shard locations, similar to ecShardMap in topology.go
 	ecShardMap := make(EcShardMap)
 	for _, ecNode := range erb.ecNodes {
 		ecShardMap.registerEcNode(ecNode, collection)
+	}
+
+	rebuilder := erb.ecNodeWithMoreFreeSlots()
+	if rebuilder.freeEcSlot < erasure_coding.TotalShardsCount {
+		return fmt.Errorf("disk space is not enough")
 	}
 
 	for vid, locations := range ecShardMap {
@@ -158,23 +164,17 @@ func (erb *ecRebuilder) rebuildEcVolumes(collection string) error {
 			return fmt.Errorf("ec volume %d is unrepairable with %d shards\n", vid, shardCount)
 		}
 
-		if err := erb.rebuildOneEcVolume(collection, vid, locations); err != nil {
-			return err
-		}
+		erb.ewg.Add(func() error {
+			return erb.rebuildOneEcVolume(collection, vid, locations, rebuilder)
+		})
 	}
 
 	return nil
 }
 
-func (erb *ecRebuilder) rebuildOneEcVolume(collection string, volumeId needle.VolumeId, locations EcShardLocations) error {
+func (erb *ecRebuilder) rebuildOneEcVolume(collection string, volumeId needle.VolumeId, locations EcShardLocations, rebuilder *EcNode) error {
 	if !erb.isLocked() {
 		return fmt.Errorf("lock is lost")
-	}
-
-	// TODO: fix this logic so it supports concurrent executions
-	rebuilder := erb.ecNodeWithMoreFreeSlots()
-	if rebuilder.freeEcSlot < erasure_coding.TotalShardsCount {
-		return fmt.Errorf("disk space is not enough")
 	}
 
 	fmt.Printf("rebuildOneEcVolume %s %d\n", collection, volumeId)
