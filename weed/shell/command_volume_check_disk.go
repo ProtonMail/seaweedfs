@@ -36,6 +36,7 @@ type volumeCheckDisk struct {
 	verbose            bool
 	applyChanges       bool
 	syncDeletions      bool
+	checkReadOnly      bool
 	nonRepairThreshold float64
 }
 
@@ -46,14 +47,21 @@ func (c *commandVolumeCheckDisk) Name() string {
 func (c *commandVolumeCheckDisk) Help() string {
 	return `check all replicated volumes to find and fix inconsistencies. It is optional and resource intensive.
 
-	How it works:
-	
-	find all volumes that are replicated
-	  for each volume id, if there are more than 2 replicas, find one pair with the largest 2 in file count.
-      for the pair volume A and B
-        append entries in A and not in B to B
-        append entries in B and not in A to A
+    How it works:
 
+    find all volumes that are replicated
+
+    for each writable volume ID, if there are more than 2 replicas, find one pair with the largest 2 in file count
+        for the pair volume A and B
+            append entries in A and not in B to B
+            append entries in B and not in A to A
+
+    optionally, for each non-writable volume replica A
+        if volume is not full
+            prune late volume entries not matching its index file
+            select a writable volume replica B
+            append missing entries from B into A
+            mark the volume as writable (healthy)
 `
 }
 
@@ -95,6 +103,7 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 		verbose:            *verbose,
 		applyChanges:       *applyChanges,
 		syncDeletions:      *syncDeletions,
+		checkReadOnly:      *forceReadonly,
 		nonRepairThreshold: *nonRepairThreshold,
 	}
 
@@ -112,24 +121,20 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 		delete(volumeReplicas, vid)
 	}
 
-	vcd.write("Pass #1 (writeable volumes)")
-	if err := vcd.checkWriteableVolumes(volumeReplicas); err != nil {
+	if err := vcd.checkWritableVolumes(volumeReplicas); err != nil {
 		return err
 	}
-	if *forceReadonly {
-		vcd.write("Pass #2 (read-only volumes)")
-		if err := vcd.checkReadOnlyVolumes(volumeReplicas); err != nil {
-			return err
-		}
-
+	if err := vcd.checkReadOnlyVolumes(volumeReplicas); err != nil {
+		return err
 	}
-	// TODO: add logic to process non-writeable volumes.
 
 	return nil
 }
 
-// checkWriteableVolumes fixes volume replicas which are not read-only.
-func (vcd *volumeCheckDisk) checkWriteableVolumes(volumeReplicas map[uint32][]*VolumeReplica) error {
+// checkWritableVolumes fixes volume replicas which are not read-only.
+func (vcd *volumeCheckDisk) checkWritableVolumes(volumeReplicas map[uint32][]*VolumeReplica) error {
+	vcd.write("Pass #1 (writeable volumes)")
+
 	// pick 1 pairs of volume replica
 	for _, replicas := range volumeReplicas {
 		// filter readonly replica
@@ -147,7 +152,7 @@ func (vcd *volumeCheckDisk) checkWriteableVolumes(volumeReplicas map[uint32][]*V
 		})
 		for len(writableReplicas) >= 2 {
 			a, b := writableReplicas[0], writableReplicas[1]
-			if !vcd.slowMode && vcd.shouldSkipVolume(a, b) {
+			if vcd.shouldSkipVolume(a, b) {
 				// always choose the larger volume to be the source
 				writableReplicas = append(replicas[:1], writableReplicas[2:]...)
 				continue
@@ -169,7 +174,74 @@ func (vcd *volumeCheckDisk) checkWriteableVolumes(volumeReplicas map[uint32][]*V
 
 // checkReadOnlyVolumes fixes volume replicas which are read-only.
 func (vcd *volumeCheckDisk) checkReadOnlyVolumes(volumeReplicas map[uint32][]*VolumeReplica) error {
-	return fmt.Errorf("not yet implemented (https://github.com/seaweedfs/seaweedfs/issues/7442)")
+	if !vcd.checkReadOnly {
+		return nil
+	}
+	vcd.write("Pass #2 (read-only volumes)")
+
+	for vid, replicas := range volumeReplicas {
+		var source *VolumeReplica = nil
+		roReplicas := []*VolumeReplica{}
+
+		for _, r := range replicas {
+			if r.info.ReadOnly {
+				roReplicas = append(roReplicas, r)
+			} else {
+				// we assume all writable replicas are identical by this point, after the checkWritableVolumes() pass.
+				source = r
+			}
+		}
+		if len(roReplicas) == 0 {
+			vcd.write("no read-only replicas for volume %d\n", vid)
+			continue
+		}
+		if source == nil {
+			vcd.write("got %d read-only replicas for volume %d and no writable replicas to fix from\n", len(roReplicas), vid)
+			continue
+		}
+
+		// attempt to fix read-only replicas from the know good source
+		for _, r := range roReplicas {
+			// TODO: skip full readonly volumes.
+			if vcd.shouldSkipVolume(r, source) {
+				continue
+			}
+
+			// make volume writable...
+			err := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(r.location.dataNode), vcd.grpcDialOption(), func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+				_, vsErr := volumeServerClient.VolumeMarkWritable(context.Background(), &volume_server_pb.VolumeMarkWritableRequest{
+					VolumeId: vid,
+				})
+				return vsErr
+			})
+			if err != nil {
+				return err
+			}
+			vcd.write("volume %d on %s is now writable\n", vid, r.location.dataNode.Id)
+
+			// ...fix it...
+			// TODO: test whether syncTwoReplicas() is enough to prune garbage entries on broken volumes.
+			if err := vcd.syncTwoReplicas(source, r, false); err != nil {
+				vcd.write("sync read-only volume %d on %s from %s: %v\n", vid, r.location.dataNode.Id, source.location.dataNode.Id, err)
+
+				// ...or revert it back to read-only, if something went wrong.
+				roErr := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(r.location.dataNode), vcd.grpcDialOption(), func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+					_, vsErr := volumeServerClient.VolumeMarkReadonly(context.Background(), &volume_server_pb.VolumeMarkReadonlyRequest{
+						VolumeId: vid,
+					})
+					return vsErr
+				})
+				if roErr != nil {
+					return fmt.Errorf("failed to make volume %d on %s readonly after: %v: %v", vid, r.location.dataNode.Id, err, roErr)
+				}
+				vcd.write("volume %d on %s is now read-only\n", vid, r.location.dataNode.Id)
+
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func (vcd *volumeCheckDisk) isLocked() bool {
@@ -227,6 +299,11 @@ func (vcd *volumeCheckDisk) eqVolumeFileCount(a, b *VolumeReplica) (bool, bool) 
 }
 
 func (vcd *volumeCheckDisk) shouldSkipVolume(a, b *VolumeReplica) bool {
+	if vcd.slowMode {
+		// never skip volumes on slow mode
+		return false
+	}
+
 	pulseTimeAtSecond := vcd.now.Add(-constants.VolumePulsePeriod * 2).Unix()
 	doSyncDeletedCount := false
 	if vcd.syncDeletions && a.info.DeleteCount != b.info.DeleteCount {
