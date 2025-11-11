@@ -38,6 +38,8 @@ type volumeCheckDisk struct {
 	syncDeletions      bool
 	checkReadOnly      bool
 	nonRepairThreshold float64
+
+	ewg *ErrorWaitGroup
 }
 
 func (c *commandVolumeCheckDisk) Name() string {
@@ -80,6 +82,7 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 	applyChangesAlias := fsckCommand.Bool("force", false, "apply the fix (alias for -apply)")
 	forceReadonly := fsckCommand.Bool("force-readonly", false, "apply the fix even on readonly volumes")
 	syncDeletions := fsckCommand.Bool("syncDeleted", false, "sync of deletions the fix")
+	maxParallelization := fsckCommand.Int("maxParallelization", DefaultMaxParallelization, "run up to X tasks in parallel, whenever possible")
 	nonRepairThreshold := fsckCommand.Float64("nonRepairThreshold", 0.3, "repair when missing keys is not more than this limit")
 	if err = fsckCommand.Parse(args); err != nil {
 		return nil
@@ -105,6 +108,8 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 		syncDeletions:      *syncDeletions,
 		checkReadOnly:      *forceReadonly,
 		nonRepairThreshold: *nonRepairThreshold,
+
+		ewg: NewErrorWaitGroup(*maxParallelization),
 	}
 
 	// collect topology information
@@ -121,10 +126,15 @@ func (c *commandVolumeCheckDisk) Do(args []string, commandEnv *CommandEnv, write
 		delete(volumeReplicas, vid)
 	}
 
+	// TODO: parallelize the first pass
 	if err := vcd.checkWritableVolumes(volumeReplicas); err != nil {
 		return err
 	}
-	if err := vcd.checkReadOnlyVolumes(volumeReplicas); err != nil {
+
+	// check & fix read-only volume
+	vcd.ewg.Reset()
+	vcd.checkReadOnlyVolumes(volumeReplicas)
+	if err := vcd.ewg.Wait(); err != nil {
 		return err
 	}
 
@@ -173,9 +183,9 @@ func (vcd *volumeCheckDisk) checkWritableVolumes(volumeReplicas map[uint32][]*Vo
 }
 
 // checkReadOnlyVolumes fixes volume replicas which are read-only.
-func (vcd *volumeCheckDisk) checkReadOnlyVolumes(volumeReplicas map[uint32][]*VolumeReplica) error {
+func (vcd *volumeCheckDisk) checkReadOnlyVolumes(volumeReplicas map[uint32][]*VolumeReplica) {
 	if !vcd.checkReadOnly {
-		return nil
+		return
 	}
 	vcd.write("Pass #2 (read-only volumes)")
 
@@ -207,41 +217,43 @@ func (vcd *volumeCheckDisk) checkReadOnlyVolumes(volumeReplicas map[uint32][]*Vo
 				continue
 			}
 
-			// make volume writable...
-			err := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(r.location.dataNode), vcd.grpcDialOption(), func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-				_, vsErr := volumeServerClient.VolumeMarkWritable(context.Background(), &volume_server_pb.VolumeMarkWritableRequest{
-					VolumeId: vid,
-				})
-				return vsErr
-			})
-			if err != nil {
-				return err
-			}
-			vcd.write("volume %d on %s is now writable\n", vid, r.location.dataNode.Id)
-
-			// ...fix it...
-			// TODO: test whether syncTwoReplicas() is enough to prune garbage entries on broken volumes.
-			if err := vcd.syncTwoReplicas(source, r, false); err != nil {
-				vcd.write("sync read-only volume %d on %s from %s: %v\n", vid, r.location.dataNode.Id, source.location.dataNode.Id, err)
-
-				// ...or revert it back to read-only, if something went wrong.
-				roErr := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(r.location.dataNode), vcd.grpcDialOption(), func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-					_, vsErr := volumeServerClient.VolumeMarkReadonly(context.Background(), &volume_server_pb.VolumeMarkReadonlyRequest{
+			vcd.ewg.Add(func() error {
+				// make volume writable...
+				err := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(r.location.dataNode), vcd.grpcDialOption(), func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+					_, vsErr := volumeServerClient.VolumeMarkWritable(context.Background(), &volume_server_pb.VolumeMarkWritableRequest{
 						VolumeId: vid,
 					})
 					return vsErr
 				})
-				if roErr != nil {
-					return fmt.Errorf("failed to make volume %d on %s readonly after: %v: %v", vid, r.location.dataNode.Id, err, roErr)
+				if err != nil {
+					return err
 				}
-				vcd.write("volume %d on %s is now read-only\n", vid, r.location.dataNode.Id)
+				vcd.write("volume %d on %s is now writable\n", vid, r.location.dataNode.Id)
 
-				return err
-			}
+				// ...fix it...
+				// TODO: test whether syncTwoReplicas() is enough to prune garbage entries on broken volumes.
+				if err := vcd.syncTwoReplicas(source, r, false); err != nil {
+					vcd.write("sync read-only volume %d on %s from %s: %v\n", vid, r.location.dataNode.Id, source.location.dataNode.Id, err)
+
+					// ...or revert it back to read-only, if something went wrong.
+					roErr := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(r.location.dataNode), vcd.grpcDialOption(), func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+						_, vsErr := volumeServerClient.VolumeMarkReadonly(context.Background(), &volume_server_pb.VolumeMarkReadonlyRequest{
+							VolumeId: vid,
+						})
+						return vsErr
+					})
+					if roErr != nil {
+						return fmt.Errorf("failed to make volume %d on %s readonly after: %v: %v", vid, r.location.dataNode.Id, err, roErr)
+					}
+					vcd.write("volume %d on %s is now read-only\n", vid, r.location.dataNode.Id)
+
+					return err
+				}
+
+				return nil
+			})
 		}
 	}
-
-	return nil
 }
 
 func (vcd *volumeCheckDisk) isLocked() bool {
